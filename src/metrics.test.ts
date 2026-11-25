@@ -279,6 +279,14 @@ test('the tooltip gives up detail in order when it would not fit', () => {
   assert.ok(cut.length <= 100)
   assert.ok(cut.startsWith('CPU 12.4%'))
   assert.ok(cut.endsWith('…'))
+
+  // A config file in use is said last. It takes room like anything else, and when even the least
+  // there is has too much to say, it is the first to go.
+  const marked = { ...crowded, configFile: true }
+  assert.equal(formatTooltip(marked), `${levels[4]} · config file`)
+  const least = levels[levels.length - 1]
+  assert.equal(formatTooltip(marked, least.length, least.length), least)
+  assert.equal(formatTooltip(marked, 100, 100), cut)
 })
 
 test('nothing the machine reports can push an update past what Orca accepts', () => {
@@ -302,6 +310,36 @@ test('nothing the machine reports can push an update past what Orca accepts', ()
   assert.ok(item.tooltip.length <= TOOLTIP_MAX)
   assert.equal(item.visible, true)
   assert.ok(item.text.startsWith('b'.repeat(13) + '… · CPU 100%'))
+  // Nor can the mark of a config file, which goes whole before anything of the reading is cut.
+  const marked = statusItemFor({ ...huge, configFile: true }, 'resources')
+  assert.equal(marked.tooltip, item.tooltip)
+})
+
+test('the tooltip ends by saying that a config file is in use, at the cost of the detail that will not fit with it', () => {
+  const cpu = 'CPU 12.4% (4 threads)'
+  const ram = 'RAM 2.0/8.0 GiB (25%)'
+  const sensors = 'Sensor 1 63°, Core 62°, CPU 0 61°'
+  const extra = 'load 1.47 1.80 2.17 · up 1d 1h'
+  const missing = 'unavailable: temperature (no readable sensor)'
+  // After everything, the reasons included, and on the bar not at all.
+  assert.equal(formatTooltip(snapshot({ configFile: true })), `${cpu} · ${MODEL} · ${ram} · ${sensors} · ${extra} · config file`)
+  const elsewhere = snapshot({ origin: ORIGIN, problems: ['temperature (no readable sensor)'] })
+  assert.equal(
+    formatTooltip({ ...elsewhere, configFile: true }),
+    `${ORIGIN.tooltip} · ${cpu} · ${ram} · ${sensors} · ${missing} · config file`
+  )
+  assert.equal(formatStatusText(snapshot({ configFile: true })), formatStatusText(snapshot()))
+  // It takes room like anything else: a reading that fits whole loses what does not fit with it,
+  // here the CPU model, and gets it back where there is room.
+  const roomy = snapshot({ cpuModel: 'm'.repeat(53) })
+  const full = formatTooltip(roomy)
+  assert.equal(full, `${cpu} · ${'m'.repeat(53)} · ${ram} · ${sensors} · ${extra}`)
+  assert.equal(formatTooltip({ ...roomy, configFile: true }), `${cpu} · ${ram} · ${sensors} · ${extra} · config file`)
+  assert.equal(formatTooltip({ ...roomy, configFile: true }, 256, 256), `${full} · config file`)
+  // The same from one reading to the next, and nothing said when no file is in use.
+  const tooltip = createTooltipSelector()
+  assert.ok(tooltip({ ...roomy, configFile: true }).endsWith(' · config file'))
+  assert.equal(formatTooltip(snapshot({ configFile: false })), formatTooltip(snapshot()))
 })
 
 test('raises the tone only near the limits', () => {

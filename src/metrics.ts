@@ -16,6 +16,8 @@ const TOOLTIP_SETTLE_READINGS = 8
 /** The room a remote reading's origin takes at the start of the item and of the tooltip. */
 export const ORIGIN_BAR_MAX = 14
 export const ORIGIN_TOOLTIP_MAX = 48
+/** What the tooltip ends with while a config file supplies some of the settings in use. */
+export const CONFIG_FILE_MARK = 'config file'
 
 const KIB = 1024
 const MIB = 1024 * KIB
@@ -73,6 +75,8 @@ export type MetricsSnapshot = {
   problems: readonly string[]
   /** Another machine the reading came from, or null for this one. */
   origin: Origin | null
+  /** Whether a config file supplies some of the settings in use, which the tooltip ends by saying. */
+  configFile?: boolean
 }
 
 export type StatusTone = 'neutral' | 'warning' | 'danger'
@@ -410,8 +414,7 @@ export function formatTooltip(
   max: number = TOOLTIP_MAX
 ): string {
   const lines = DETAIL_LEVELS.map((level) => composeTooltip(snapshot, level))
-  const line = lines[detailLevel(lines, target, max)]
-  return line.length <= max ? line : clip(line, max)
+  return fitted(snapshot, detailLevel(lines, target, max), max)
 }
 
 /** The tooltip for one reading; a selector made by `createTooltipSelector` remembers the one before. */
@@ -451,8 +454,7 @@ export function createTooltipSelector(
       fittingFor = 1
     }
     wanted = level
-    const line = lines[current]
-    return line.length <= max ? line : clip(line, max)
+    return fitted(snapshot, current, max)
   }
   selector.reset = (): void => {
     current = -1
@@ -460,6 +462,20 @@ export function createTooltipSelector(
     fittingFor = 0
   }
   return selector
+}
+
+/**
+ * The tooltip at one level of detail: whole where it fits `max`, else without the config file's
+ * mark, which the reading can do without, else cut short.
+ */
+function fitted(snapshot: MetricsSnapshot, level: number, max: number): string {
+  const detail = DETAIL_LEVELS[level]
+  const line = composeTooltip(snapshot, detail)
+  if (line.length <= max || !snapshot.configFile) {
+    return line.length <= max ? line : clip(line, max)
+  }
+  const unmarked = composeTooltip({ ...snapshot, configFile: false }, detail)
+  return unmarked.length <= max ? unmarked : clip(unmarked, max)
 }
 
 function composeTooltip(snapshot: MetricsSnapshot, level: Detail): string {
@@ -503,6 +519,10 @@ function composeTooltip(snapshot: MetricsSnapshot, level: Detail): string {
   if (snapshot.problems.length > 0) {
     const problems = snapshot.problems.slice(0, PROBLEMS_MAX).map((problem) => cleanText(problem, PROBLEM_MAX))
     parts.push(`unavailable: ${problems.join(', ')}`)
+  }
+  // Last, after the reasons: it is what the tooltip can most easily do without.
+  if (snapshot.configFile) {
+    parts.push(CONFIG_FILE_MARK)
   }
   return parts.join(SEPARATOR)
 }

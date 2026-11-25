@@ -5,7 +5,9 @@
 // escaped error ends the worker, and one that fails to activate stays down until the plugin
 // changes. A step that fails at start is logged and tried again on the next reading.
 
+import { homedir } from 'node:os'
 import type { Disposable, OrcaWorkerApi } from 'orca/worker'
+import { configFilePath, noConfigFile, readConfigFile, type ConfigFile } from './config-file'
 import { createCollector, type Collector } from './collector'
 import { describeError, logOnce } from './log'
 import {
@@ -53,6 +55,10 @@ export type PluginConfig = {
   orcaCli: string
   /** What the person set, 1 to 60 seconds. */
   refreshSeconds: number
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function textOf(value: unknown, fallback: string): string {
@@ -355,6 +361,9 @@ function start(orca: OrcaWorkerApi): () => Promise<void> {
   const log = logOnce((message: string) => orca.log(message))
   const tooltip: TooltipSelector = createTooltipSelector()
   const collector: Collector = createCollector({ reader: createSystemReader() })
+  const configPath = configFilePath(process.env, homedir())
+  let file: ConfigFile = noConfigFile()
+  let settings: Record<string, unknown> = {}
   let config: PluginConfig = configOf({})
   let settingsRead = false
   let remote: RemoteSource | null = null
@@ -370,9 +379,14 @@ function start(orca: OrcaWorkerApi): () => Promise<void> {
     }
   }
 
-  /** Follows the settings into local or remote mode, and to a new terminal when the target or the interval changed. */
-  const applySettings = (settings: Record<string, unknown>): void => {
-    config = configOf(settings)
+  /**
+   * Follows the settings into local or remote mode, and to a new terminal when the target or the
+   * interval changed. The config file's values come first, key by key; with none of them the
+   * settings are read as they are.
+   */
+  const applyConfig = (): void => {
+    const values = file.values
+    config = configOf(Object.keys(values).length === 0 ? settings : { ...settings, ...values })
     const key = config.remote && config.targetWorkspace !== '' ? remoteKeyOf(config) : ''
     if (key === remoteKey) {
       return
@@ -393,29 +407,64 @@ function start(orca: OrcaWorkerApi): () => Promise<void> {
     }
   }
 
+  /**
+   * Reads the config file, as before every reading, so that a change in it applies from this
+   * reading on. What is wrong with it is logged once.
+   */
+  const readConfig = async (): Promise<void> => {
+    const next = await readConfigFile(configPath)
+    if (next.reason !== null && next.reason !== file.reason) {
+      log(next.reason)
+    }
+    file = next
+  }
+
   /** Reads the settings once; when that fails it is tried again on the next reading. */
   const readSettings = async (): Promise<void> => {
     if (settingsRead) {
       return
     }
     try {
-      applySettings((await orca.settings.get()) as Record<string, unknown>)
+      const read: unknown = await orca.settings.get()
+      if (!isRecord(read)) {
+        throw new TypeError('the settings are not an object')
+      }
+      settings = read
       settingsRead = true
     } catch (error) {
       log(`could not read the settings, using the defaults: ${describeError(error)}`)
     }
   }
 
+  /**
+   * The reading with what the item is to say of the config file: that it is in use, and why it
+   * was not all used.
+   */
+  const noted = (snapshot: MetricsSnapshot): MetricsSnapshot => {
+    const inUse = Object.keys(file.values).length > 0
+    if (!inUse && file.problem === null) {
+      return snapshot
+    }
+    return {
+      ...snapshot,
+      ...(file.problem === null ? {} : { problems: [file.problem, ...snapshot.problems] }),
+      ...(inUse ? { configFile: true } : {})
+    }
+  }
+
   const sample = async (): Promise<Reading> => {
     listen()
+    await readConfig()
     await readSettings()
+    applyConfig()
     if (remote) {
-      return remote.read()
+      const reading = await remote.read()
+      return { retryInMs: reading.retryInMs, snapshot: noted(reading.snapshot) }
     }
     if (config.remote) {
-      return { snapshot: emptySnapshot(['set the workspace to measure (targetWorkspace)']) }
+      return { snapshot: noted(emptySnapshot(['set the workspace to measure (targetWorkspace)'])) }
     }
-    return { snapshot: await collector.sample() }
+    return { snapshot: noted(await collector.sample()) }
   }
 
   const loop = startLoop({

@@ -1,12 +1,13 @@
 // The poll, the sampling behind it, and the worker as Orca starts it. Timers and readings are the
 // test's own, so nothing here waits on a real interval or needs a real sensor.
 
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { assert, hostError, mockHost, mountWorker, test } from 'orca/testing'
+import { afterEach, assert, beforeEach, hostError, mockHost, mountWorker, test, type TestWorker } from 'orca/testing'
 import { createCollector } from './collector'
+import { CONFIG_FILE_ENV } from './config-file'
 import { logOnce } from './log'
 import {
   STATUS_TEXT_MAX,
@@ -20,6 +21,7 @@ import {
 } from './metrics'
 import { STATS_MARKER } from './stats-command'
 import type { Reading, SystemReader } from './system'
+import type { JsonValue } from 'orca/worker'
 import * as main from './worker'
 import {
   configOf,
@@ -37,6 +39,39 @@ import {
   type Reading as LoopReading,
   type Scheduler
 } from './worker'
+
+/** An environment variable as it was, to be put back. */
+const HOME = process.env.HOME
+const NAMED = process.env[CONFIG_FILE_ENV]
+/** A folder of the test's own, and the config file the worker is told to read in it. */
+let folder = ''
+let configFile = ''
+
+/**
+ * The worker reads a config file from wherever its environment says, so every test here names one
+ * in a folder of its own: nothing from the home folder of whoever runs the tests reaches it. The
+ * home folder is pointed there too, for the test that leaves the variable out.
+ */
+beforeEach(async () => {
+  folder = await mkdtemp(join(tmpdir(), 'server-stats-worker-'))
+  configFile = join(folder, 'config.json')
+  process.env[CONFIG_FILE_ENV] = configFile
+  process.env.HOME = join(folder, 'home')
+})
+
+afterEach(async () => {
+  if (NAMED === undefined) {
+    delete process.env[CONFIG_FILE_ENV]
+  } else {
+    process.env[CONFIG_FILE_ENV] = NAMED
+  }
+  if (HOME === undefined) {
+    delete process.env.HOME
+  } else {
+    process.env.HOME = HOME
+  }
+  await rm(folder, { recursive: true, force: true })
+})
 
 /** Timers the test fires by hand. `pending()` is what each waiting timer was told to wait. */
 function manualTimers(): { scheduler: Scheduler; pending(): number[]; fire(): void } {
@@ -663,7 +698,7 @@ test('a workspace\'s machine with no Orca CLI to reach it says so, and the worke
   const host = mockHost({
     settings: {
       source: 'remote',
-      targetWorkspace: 'id:00000000-0000-0000-0000-000000000000::/nowhere',
+      targetWorkspace: 'id:11111111-1111-1111-1111-111111111111::/nowhere',
       orcaCli: join(tmpdir(), 'no-such-orca-cli')
     },
     results: {
@@ -728,35 +763,267 @@ async function waitsUntil(ready: () => boolean): Promise<void> {
   assert.ok(ready(), 'the update never came')
 }
 
+/** What the Settings screen can hold, and so what a config file can hold once parsed. */
+type Settings = Record<string, JsonValue>
+
+/** The config file of the test, where the worker is told to look for one, holding these settings. */
+const writeConfig = (settings: Settings): Promise<void> => writeFile(configFile, JSON.stringify(settings))
+
+/** A workspace selector that is no workspace's, so that the item names it by its folder, `nowhere`. */
+const NOWHERE = 'id:11111111-1111-1111-1111-111111111111::/nowhere'
+/** What the item then says of why there is no reading, with no Orca CLI to reach it. */
+const NOT_FOUND = 'Orca CLI not found (see the Orca CLI setting)'
+
+/** The `orca` to reach a workspace with: one that is not there, so that no test runs a real one. */
+const noCli = (): string => join(folder, 'no-such-orca-cli')
+
+/** A config file that asks for a workspace's machine which no CLI can reach. */
+const unreachable = (): Settings => ({
+  source: 'remote',
+  targetWorkspace: NOWHERE,
+  orcaCli: noCli()
+})
+
+/**
+ * Notes every item the worker sends. `next()` answers with the first one to come after it was
+ * asked for, so that a test waits on a reading and not on a clock.
+ */
+function inbox(): { items: StatusItem[]; next(): Promise<StatusItem>; update: (item: StatusItem) => { ok: true } } {
+  const items: StatusItem[] = []
+  let waiting: Array<(item: StatusItem) => void> = []
+  return {
+    items,
+    next: () =>
+      new Promise<StatusItem>((resolve) => {
+        waiting.push(resolve)
+      }),
+    update: (item) => {
+      items.push(item)
+      const tell = waiting
+      waiting = []
+      for (const resolve of tell) {
+        resolve(item)
+      }
+      return { ok: true }
+    }
+  }
+}
+
+/** The worker over a host whose settings are `settings`, with every item it sends noted. */
+async function started(settings: Settings = {}): Promise<ReturnType<typeof inbox> & { worker: TestWorker }> {
+  const box = inbox()
+  const worker = await mountWorker(main, { host: mockHost({ settings, results: { 'statusBar.update': box.update } }) })
+  return { ...box, worker }
+}
+
+/** What the tooltip ends with while a config file is in use, with the separator before it. */
+const IN_USE = ' · config file'
+
+test('without a config file the settings are used as they are, and nothing speaks of one', async () => {
+  // The variable names a file that is not there, which comes to the same as no variable.
+  const { next, worker } = await started()
+  try {
+    const item = await Promise.race([next(), givesUp()])
+    assert.ok(item.text.startsWith('CPU '))
+    assert.ok(!item.tooltip.includes('config file'))
+    assert.ok(!item.tooltip.includes('unavailable'))
+    assert.deepEqual(worker.logs, [])
+    assert.deepEqual(worker.refusals, [])
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('a config file comes before the settings, key by key, and the tooltip ends by saying it is in use', async () => {
+  await writeConfig({ source: 'remote', targetWorkspace: NOWHERE })
+  // The file leaves the CLI to the settings, which name one. Their source, this computer's, gives way to the file's.
+  const { next, worker } = await started({ orcaCli: noCli(), refreshSeconds: 3 })
+  try {
+    const item = await Promise.race([next(), givesUp()])
+    assert.equal(item.text, 'nowhere · No host stats')
+    assert.equal(item.tooltip, `nowhere (this computer) · unavailable: ${NOT_FOUND}${IN_USE}`)
+    assert.ok(worker.logs.every((line) => !line.includes('config file')))
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('where the file gives a setting, the settings give way', async () => {
+  // The settings ask for a workspace's machine that cannot be reached; the file asks for this computer.
+  await writeConfig({ source: 'local', refreshSeconds: 1 })
+  const { next, worker } = await started(unreachable())
+  try {
+    const item = await Promise.race([next(), givesUp()])
+    assert.ok(item.text.startsWith('CPU '))
+    assert.ok(item.tooltip.endsWith(IN_USE))
+    assert.ok(!item.tooltip.includes('unavailable'))
+    // No terminal was ever tried, so nothing was logged.
+    assert.deepEqual(worker.logs, [])
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('the file is the one the environment variable names, and else the one in the home folder', async () => {
+  // Somewhere else altogether, under another name.
+  const elsewhere = join(folder, 'elsewhere.json')
+  process.env[CONFIG_FILE_ENV] = elsewhere
+  await writeFile(elsewhere, JSON.stringify(unreachable()))
+  // Where the worker would look otherwise, saying the opposite.
+  await writeConfig({ source: 'local' })
+  const named = await started()
+  try {
+    const item = await Promise.race([named.next(), givesUp()])
+    assert.equal(item.text, 'nowhere · No host stats')
+    assert.ok(item.tooltip.endsWith(IN_USE))
+  } finally {
+    await named.worker.deactivate()
+  }
+  if (process.platform === 'win32') {
+    // The home folder is found another way there.
+    return
+  }
+  // With no variable, the file in the home folder is the one; the one beside the first is not.
+  delete process.env[CONFIG_FILE_ENV]
+  const inHome = join(process.env.HOME as string, '.config', 'orca-server-stats', 'config.json')
+  await mkdir(dirname(inHome), { recursive: true })
+  await writeFile(inHome, JSON.stringify(unreachable()))
+  const byDefault = await started()
+  try {
+    const item = await Promise.race([byDefault.next(), givesUp()])
+    assert.equal(item.text, 'nowhere · No host stats')
+    assert.ok(item.tooltip.endsWith(IN_USE))
+  } finally {
+    await byDefault.worker.deactivate()
+  }
+})
+
+test('the file is read before every reading: a change applies from the next one on, and deleting it gives the settings back', async () => {
+  await writeConfig(unreachable())
+  // A minute between readings, where the settings have a say.
+  const { next, worker } = await started({ refreshSeconds: 60 })
+  try {
+    const first = await Promise.race([next(), givesUp()])
+    assert.equal(first.text, 'nowhere · No host stats')
+    assert.ok(first.tooltip.endsWith(IN_USE))
+    // Now this computer, every second.
+    await writeConfig({ source: 'local', refreshSeconds: 1 })
+    const changed = await Promise.race([next(), givesUp()])
+    assert.ok(changed.text.startsWith('CPU '))
+    assert.ok(changed.tooltip.endsWith(IN_USE))
+    assert.ok(!changed.tooltip.includes('unavailable'))
+    // Deleted. The reading that follows comes a second later, so it is the file's interval that was
+    // in use, and from it on the settings are used alone: nothing speaks of a file any more.
+    await unlink(configFile)
+    const deleted = await Promise.race([next(), givesUp()])
+    assert.ok(deleted.text.startsWith('CPU '))
+    assert.ok(!deleted.tooltip.includes('config file'))
+    assert.ok(!deleted.tooltip.includes('unavailable'))
+    assert.ok(worker.logs.every((line) => !line.includes('config file')))
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('a file that is not JSON is left wholly to the settings, said in the tooltip, and logged once', async () => {
+  await writeFile(configFile, '{oops')
+  const { next, worker } = await started({ refreshSeconds: 1 })
+  const once = [`config file ${configFile}: invalid JSON; the Settings values are used instead`]
+  try {
+    const first = await Promise.race([next(), givesUp()])
+    assert.ok(first.text.startsWith('CPU '))
+    assert.ok(first.tooltip.includes('unavailable: config file: invalid JSON'))
+    assert.ok(!first.tooltip.endsWith(IN_USE))
+    assert.deepEqual(worker.logs, once)
+    // Readings go on, and each reads the same broken file: the log says no more.
+    await new Promise((resolve) => setTimeout(resolve, 2_500))
+    assert.deepEqual(worker.logs, once)
+    assert.deepEqual(worker.refusals, [])
+    // Another fault is said too, once, when it comes.
+    await writeConfig({ refreshSeconds: '5' })
+    const second = await Promise.race([next(), givesUp()])
+    assert.ok(second.tooltip.includes('unavailable: config file: invalid refreshSeconds'))
+    assert.ok(!second.tooltip.endsWith(IN_USE))
+    // The Settings value is used for it, and the log says which.
+    const again = `config file ${configFile}: refreshSeconds is not a whole number from 1 to 60; the Settings value is used for each`
+    assert.deepEqual(worker.logs, [...once, again])
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('a value the Settings screen would not take is left to it and named, while the rest of the file is used', async () => {
+  await writeConfig({ ...unreachable(), environment: 7, refreshSeconds: '5' })
+  const { next, worker } = await started()
+  const configLines = (): string[] => worker.logs.filter((line) => line.startsWith('config file '))
+  try {
+    const item = await Promise.race([next(), givesUp()])
+    assert.equal(item.text, 'nowhere · No host stats')
+    assert.equal(item.tooltip, `nowhere (this computer) · unavailable: config file: invalid environment +1 more, ${NOT_FOUND}${IN_USE}`)
+    // The Settings value is used for it, and the log says which.
+    const faults = 'environment is not text of at most 128 characters, refreshSeconds is not a whole number from 1 to 60'
+    assert.deepEqual(configLines(), [`config file ${configFile}: ${faults}; the Settings value is used for each`])
+    // Later readings say other things, of the CLI that is not there; the file is not spoken of again.
+    await waitsUntil(() => worker.logs.filter((line) => line.startsWith('remote: ')).length >= 2)
+    assert.equal(configLines().length, 1)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('a file that asks for a workspace\'s machine without naming the workspace says what is missing, and that it is in use', async () => {
+  await writeConfig({ source: 'remote', refreshSeconds: 'soon' })
+  const { next, worker } = await started()
+  try {
+    const item = await Promise.race([next(), givesUp()])
+    assert.equal(item.text, 'No host stats')
+    assert.equal(item.tooltip, `unavailable: config file: invalid refreshSeconds, set the workspace to measure (targetWorkspace)${IN_USE}`)
+    assert.equal(worker.logs.length, 1)
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+/**
+ * A stand-in for the Orca CLI, run as the real one is: it notes its calls in `<dir>/calls`, each
+ * followed by the server it was asked to reach where there was one, opens one terminal, and has
+ * the stats script's line in it. It answers `cli`, the command to run.
+ */
+async function standIn(dir: string): Promise<string> {
+  const cli = join(dir, 'orca')
+  await writeFile(
+    cli,
+    [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs')",
+      'const args = process.argv.slice(2)',
+      'const server = process.env.ORCA_ENVIRONMENT',
+      `fs.appendFileSync('${join(dir, 'calls')}', args.slice(0, 2).join(' ') + (server ? ' ' + server : '') + '\\n')`,
+      "const answer = (result) => process.stdout.write(JSON.stringify({ ok: true, result }) + '\\n')",
+      "switch (args.slice(0, 2).join(' ')) {",
+      "  case 'worktree show': answer({ worktree: { displayName: 'site' } }); break",
+      "  case 'terminal list': answer({ terminals: [] }); break",
+      "  case 'terminal create': answer({ terminal: { handle: 'term_1' } }); break",
+      `  case 'terminal read': answer({ terminal: { status: 'running', tail: [fs.readFileSync('${join(dir, 'reading')}', 'utf8').trim()] } }); break`,
+      '  default: answer({})',
+      '}',
+      ''
+    ].join('\n')
+  )
+  await writeFile(
+    join(dir, 'reading'),
+    `${STATS_MARKER}{"v":1,"seq":1,"cpu":87,"cores":4,"mem":[8388608,2097152],"temp":[{"t":"acpitz","c":63000}]}`
+  )
+  await chmod(cli, 0o755)
+  return cli
+}
+
 if (process.platform !== 'win32') {
   test('for a workspace\'s machine the worker reaches it through the Orca CLI, and closes its terminal when it stops', async () => {
     // A stand-in for the Orca CLI, run as the real one is: it notes its calls, opens one terminal,
     // and has the stats script's line in it.
     const dir = await mkdtemp(join(tmpdir(), 'server-stats-orca-'))
-    const cli = join(dir, 'orca')
-    await writeFile(
-      cli,
-      [
-        '#!/usr/bin/env node',
-        "const fs = require('node:fs')",
-        'const args = process.argv.slice(2)',
-        `fs.appendFileSync('${join(dir, 'calls')}', args.slice(0, 2).join(' ') + '\\n')`,
-        "const answer = (result) => process.stdout.write(JSON.stringify({ ok: true, result }) + '\\n')",
-        "switch (args.slice(0, 2).join(' ')) {",
-        "  case 'worktree show': answer({ worktree: { displayName: 'site' } }); break",
-        "  case 'terminal list': answer({ terminals: [] }); break",
-        "  case 'terminal create': answer({ terminal: { handle: 'term_1' } }); break",
-        `  case 'terminal read': answer({ terminal: { status: 'running', tail: [fs.readFileSync('${join(dir, 'reading')}', 'utf8').trim()] } }); break`,
-        '  default: answer({})',
-        '}',
-        ''
-      ].join('\n')
-    )
-    await writeFile(
-      join(dir, 'reading'),
-      `${STATS_MARKER}{"v":1,"seq":1,"cpu":87,"cores":4,"mem":[8388608,2097152],"temp":[{"t":"acpitz","c":63000}]}`
-    )
-    await chmod(cli, 0o755)
+    const cli = await standIn(dir)
     const updates: StatusItem[] = []
     const host = mockHost({
       settings: { source: 'remote', targetWorkspace: 'id:abc::/home/me/site', orcaCli: cli },
@@ -784,6 +1051,53 @@ if (process.platform !== 'win32') {
     // One terminal opened, read until a reading came, and closed when the worker stopped.
     assert.equal(calls, 'worktree show\nterminal list\nterminal create\nterminal read\nterminal close\n')
   })
+
+  test('a change in the file closes the terminal in use and opens another, as a change in the settings does', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'server-stats-orca-'))
+    const calls = join(dir, 'calls')
+    const cli = await standIn(dir)
+    const measured = { source: 'remote', targetWorkspace: 'id:abc::/home/me/site', orcaCli: cli, refreshSeconds: 3 }
+    await writeConfig(measured)
+    let lines: string[] = []
+    try {
+      const { items, worker } = await started()
+      try {
+        // One terminal, opened and read until a reading came out of it.
+        await waitsUntil(() => items.some((item) => item.text.startsWith('site · CPU')))
+        // Another server, set in the file. At the next reading the terminal in use is closed, and
+        // one is opened on that server.
+        await writeConfig({ ...measured, environment: 'my-server' })
+        await waitsUntil(() => items.some((item) => item.tooltip.startsWith('site on my-server ·')))
+        assert.ok(worker.logs.every((line) => !line.includes('config file')))
+      } finally {
+        await worker.deactivate()
+      }
+      // The terminal let go is closed by a process of its own, which may be a moment behind
+      // the worker.
+      await waitsFor(async () => (await readFile(calls, 'utf8')).includes('terminal close\n'))
+      lines = (await readFile(calls, 'utf8')).trim().split('\n')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+    // This computer's terminal: opened once, read, closed once, and never opened again.
+    const own = lines.filter((line) => !line.endsWith(' my-server'))
+    const reads = own.filter((line) => line === 'terminal read').length
+    assert.ok(reads >= 1)
+    assert.deepEqual(own, ['worktree show', 'terminal list', 'terminal create', ...Array<string>(reads).fill('terminal read'), 'terminal close'])
+    // The paired server's: opened for the file's new server, and closed when the worker stopped.
+    const paired = lines.filter((line) => line.endsWith(' my-server'))
+    assert.deepEqual(paired.slice(0, 3), ['worktree show my-server', 'terminal list my-server', 'terminal create my-server'])
+    assert.equal(paired.at(-1), 'terminal close my-server')
+    assert.ok(paired.slice(3, -1).every((line) => line === 'terminal read my-server'))
+  })
+}
+
+/** As `waitsUntil`, for what can only be known by asking; fails the test if it never holds. */
+async function waitsFor(ready: () => Promise<boolean>): Promise<void> {
+  for (let waited = 0; !(await ready()) && waited < 8_000; waited += 20) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.ok(await ready(), 'it never came')
 }
 
 /** Lets what a just-resolved promise started run to its end. */

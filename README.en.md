@@ -4,7 +4,7 @@
 
 **Server Stats** is an Orca plugin (id `server-stats`) that puts one item in the status bar at the bottom of the Orca window: the CPU, RAM, temperature and GPU use of a machine. The machine is either the computer the Orca desktop app runs on, or the one hosting a workspace on a paired Orca server.
 
-This document describes plugin version `0.2.0` (`orca-plugin.json`).
+This document describes plugin version `0.2.1` (`orca-plugin.json`).
 
 ## Screenshots
 
@@ -60,6 +60,7 @@ site on my-server · CPU 12.4% (8 threads) · Example CPU · RAM 3.4/16.0 GiB (2
 | `load` | 1, 5 and 15 minute load averages. Left out when all are 0 |
 | `up` | Time since boot, as `2d 3h`, `3h 4m` or `5m` |
 | `unavailable` | What could not be read, and why. At most 3 |
+| `config file` | Only while a [config file](#settings-file) supplies some of the settings. Then always last on the line |
 
 Orca draws a tooltip as one line that does not wrap, so it is kept to about 180 characters where it can be, and never passes 256. A reading with a lot to say gives up detail in this order: the CPU model, then `load` and `up`, then the sensors (5 → 3 → 1 → the hottest temperature only), then GPU memory. Detail is dropped at once, since it has to be, but comes back only after the same level has fit for 8 readings in a row, so that the tooltip does not keep changing.
 
@@ -113,7 +114,8 @@ It asks for no other capability. With this access the worker:
 
 - reads `/proc/stat` and `/proc/meminfo`, and `/sys/class/hwmon`, `/sys/class/thermal` and `/sys/class/drm` on Linux;
 - runs `nvidia-smi`, and on macOS `sysctl` and `vm_stat`;
-- for a workspace's machine, runs the Orca CLI: `worktree show`, and `terminal list`, `create`, `read` and `close`. It opens and closes only terminals titled `orca-server-stats`, and only in the workspace named in the settings.
+- for a workspace's machine, runs the Orca CLI: `worktree show`, and `terminal list`, `create`, `read` and `close`. It opens and closes only terminals titled `orca-server-stats`, and only in the workspace named in the settings;
+- reads the plugin's [config file](#settings-file), where the environment or the home folder has it.
 
 The worker makes no network request of its own. Reaching a paired server is the Orca CLI's doing.
 
@@ -121,7 +123,7 @@ Approval is asked again when the plugin, its version, its files or its access di
 
 ## Settings
 
-Orca shows them in Settings, under the plugin. A changed setting applies from the next reading on.
+Orca shows them in Settings, under the plugin. A changed setting applies from the next reading on. A [config file](#settings-file) can set them too, and comes first.
 
 | Title | Key | Type | Default | Meaning |
 | --- | --- | --- | --- | --- |
@@ -134,6 +136,39 @@ Orca shows them in Settings, under the plugin. A changed setting applies from th
 - A value outside 1 to 60 is brought to the nearest end, and one that is not a number falls back to 2.
 - This computer is read at the interval you set. A workspace's machine is read at what you set from 3 to 60; 1 and 2 give 5 seconds, since each reading starts an Orca CLI process.
 - A new server, workspace, CLI command or interval closes the terminal in use, where there is one, and opens another.
+
+## Settings file
+
+The same settings in a JSON file, for an agent or a script on the computer that runs the app to set: neither can reach the Settings screen. **A value in the file comes before the value in Settings, key by key.** A key the file leaves out keeps its Settings value, and with no file everything is as the Settings screen has it.
+
+The plugin looks for the file:
+
+- where the `ORCA_SERVER_STATS_CONFIG` environment variable says, when it is set and not empty;
+- else at `~/.config/orca-server-stats/config.json`, where `~` is your home folder.
+
+`~` at the start names the home folder in both. Give the whole path. The variable has to be in the environment of the app that starts the plugin's worker: an app opened from the macOS Dock does not get what a shell profile sets, so there the file belongs in the home folder.
+
+```json
+{
+  "source": "remote",
+  "environment": "my-server",
+  "targetWorkspace": "id:11111111-1111-1111-1111-111111111111::/home/me/projects/site",
+  "orcaCli": "~/.config/orca/cli/bin/orca",
+  "refreshSeconds": 5
+}
+```
+
+- **Keys and values**: those of the settings table above, and each value takes what the Settings screen takes. `source` is `"local"` or `"remote"`. `environment`, `targetWorkspace` and `orcaCli` are text, empty allowed, as long as the setting allows. `refreshSeconds` is a whole number from 1 to 60, and gives a workspace's machine 5 seconds for 1 and 2, as in Settings. A key that is no setting is ignored, and the file may hold any part of the five. As in Settings, `orcaCli` names a command that is then run with your account's access, so the file should be yours to write.
+- **Changes**: the file is read again before every reading, and what changed in it applies from that reading on. A new server, workspace, CLI command or interval closes the terminal in use, where there is one, and opens another, as a change in Settings does.
+- **To stop using it**: delete the file. From the next reading on, the Settings values apply again.
+- **While it is in use**: the tooltip ends with `config file`. It is the last thing on the line. When even the shortest tooltip has no room for it, it is left out.
+- **A file that cannot be used**, in whole or in part, gives way to the Settings values, and the worker goes on. The reason is among the tooltip's `unavailable` entries, and the log has it once:
+  - Not valid JSON. None of the file is used: `unavailable: config file: invalid JSON`
+  - JSON, but not an object, as `[]` is. None of the file is used: `unavailable: config file: not a JSON object`
+  - A value the Settings screen would not take. That value alone is left to Settings, and the rest of the file is used. The first key that is wrong is named, with how many more there are: `unavailable: config file: invalid refreshSeconds`
+  - There, and not readable: `unavailable: config file: could not be read (EACCES)`
+
+  `orca plugin logs <plugin-key>` names the file and every value that was refused.
 
 ## How it works
 
@@ -240,12 +275,14 @@ What has been tried:
 
 - **The item exists in the desktop app only.**
 - **Windows has not been tried in either mode.**
+- **The config file is not watched.** It is read before each reading, so a change shows at the next reading at the latest: within 2 seconds for this computer, and within the reading interval for a workspace's machine, 60 seconds at the most.
 
 ## When a reading fails
 
 - A sensor that cannot be read, a missing command or a refused file never stops the worker and never shows a wrong number. The metric is left out and the tooltip says why, for example `unavailable: temperature (no readable sensor)`.
 - A machine with no GPU says nothing about a GPU: having no `nvidia-smi` at all is not a failure.
 - The worker logs the same failure once. After three failed updates in a row it waits 10 seconds between readings until one gets through.
+- A config file that cannot be used is not a failed reading. The Settings values stand in, the tooltip says why under `unavailable`, and the log says it once: see [Settings file](#settings-file).
 - If the item still shows `…` or does not appear, check `orca plugin list`: `pending` means approval is needed. With the status `errored`, `orca plugin logs <plugin-key>` says why.
 
 ## Develop
@@ -263,6 +300,7 @@ Orca transpiles the TypeScript when it loads the plugin, so there is no build st
 ```
 src/
   worker.ts         the Orca worker: the poll, the settings, statusBar.update
+  config-file.ts    the settings in a JSON file: where it is, what it may hold, and what is said of it when it cannot be used
   collector.ts      one reading of this machine: asks the reader for each metric
   system.ts         the reads: /proc, /sys, nvidia-smi, and what Node and macOS report elsewhere
   metrics.ts        the arithmetic and the status bar strings
@@ -274,7 +312,7 @@ src/
   types/node.d.ts
 ```
 
-The tests need no Orca: the CLI, the terminal and `nvidia-smi` are the tests' own, except that `stats-command.test.ts` runs the script for real on the machine for a moment.
+The tests need no Orca: the CLI, the terminal and `nvidia-smi` are the tests' own, except that `stats-command.test.ts` runs the script for real on the machine for a moment. The config file they read is in a temporary folder, never in your home folder.
 
 ## License
 

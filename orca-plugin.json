@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "server-stats",
   "name": "Server Stats",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "CPU, RAM, temperature and GPU use in the status bar: of this computer, or of the machine hosting a workspace on a paired Orca server.",
   "engines": {
     "orca": ">=1.4.248"

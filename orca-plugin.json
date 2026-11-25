@@ -1,0 +1,82 @@
+{
+  "manifestVersion": 2,
+  "id": "server-stats",
+  "name": "Server Stats",
+  "version": "0.2.0",
+  "description": "CPU, RAM, temperature and GPU use in the status bar: of this computer, or of the machine hosting a workspace on a paired Orca server.",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "statusBarItems": [
+      {
+        "id": "resources",
+        "text": "…",
+        "icon": "gauge",
+        "tone": "neutral",
+        "tooltip": "Reading the machine's CPU, memory, temperature and GPU use"
+      }
+    ],
+    "settings": [
+      {
+        "key": "source",
+        "title": "Measure",
+        "description": "This computer, or the machine that hosts a workspace on a paired Orca server.",
+        "type": "string",
+        "enum": [
+          "local",
+          "remote"
+        ],
+        "enumLabels": [
+          "This computer",
+          "A workspace's machine"
+        ],
+        "default": "local"
+      },
+      {
+        "key": "environment",
+        "title": "Orca server",
+        "description": "For a workspace's machine: the paired Orca server it is on, as `orca environment list --json` names it. Leave empty for this computer's own Orca.",
+        "type": "string",
+        "default": "",
+        "placeholder": "my-server",
+        "maxLength": 128
+      },
+      {
+        "key": "targetWorkspace",
+        "title": "Workspace",
+        "description": "The workspace whose machine is measured. Take its selector from `orca worktree ps --since 30d --json`: `id:` followed by its worktreeId, or `identity:` followed by its identity key.",
+        "type": "string",
+        "default": "",
+        "placeholder": "id:<repo id>::/home/me/project",
+        "maxLength": 1024
+      },
+      {
+        "key": "orcaCli",
+        "title": "Orca CLI",
+        "description": "The `orca` command the plugin runs to reach that server. Change it when `orca` is not on the app's PATH; `~` stands for your home folder.",
+        "type": "string",
+        "default": "orca",
+        "placeholder": "~/.config/orca/cli/bin/orca",
+        "maxLength": 512
+      },
+      {
+        "key": "refreshSeconds",
+        "title": "Refresh every",
+        "description": "Seconds between readings. This computer is read every 2 seconds. A workspace's machine every 5, since each reading starts an Orca CLI process; set 3 to 60 to change that.",
+        "type": "integer",
+        "default": 2,
+        "minimum": 1,
+        "maximum": 60
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "settings:own"
+    }
+  ]
+}
